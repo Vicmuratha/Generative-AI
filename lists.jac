@@ -136,3 +136,4 @@ with entry {
 
     print("🌾 FarmNet Demo Complete — Check console for analysis!");
 }
+
