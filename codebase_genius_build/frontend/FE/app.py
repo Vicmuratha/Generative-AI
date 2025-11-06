@@ -8,498 +8,587 @@ import requests
 import time
 import json
 from datetime import datetime
-from typing import Dict, Any, Optional, Tuple
+from typing import Optional
+from dataclasses import dataclass, asdict
+from enum import Enum
 import os
 from pathlib import Path
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # Configuration
 # ============================================================================
 
+@dataclass
 class Config:
-    """Application configuration"""
-    APP_TITLE = "Codebase Genius"
-    APP_SUBTITLE = "AI-Powered Documentation Generation from GitHub Repositories"
-    API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
-    REQUEST_TIMEOUT = 600  # 10 minutes
-    POLL_INTERVAL = 2  # seconds
-    MAX_RETRIES = 3
+    """Application configuration with validation"""
+    app_title: str = "Codebase Genius"
+    app_subtitle: str = "AI-Powered Documentation Generation from GitHub Repositories"
+    api_base_url: str = os.getenv("API_BASE_URL", "http://localhost:8000")
+    request_timeout: int = 600  # 10 minutes
+    poll_interval: int = 2  # seconds
+    max_retries: int = 3
+    max_history: int = 10
     
-    # API endpoints
-    ENDPOINTS = {
-        "sync": "/walker/start_api",
-        "async": "/walker/start_api_async",
-        "status": "/walker/check_job_status",
-        "validate": "/walker/validate_url",
-        "health": "/health",
-        "version": "/walker/version_info"
-    }
+    @property
+    def endpoints(self) -> dict[str, str]:
+        """API endpoint paths"""
+        return {
+            "sync": "/walker/start_api",
+            "async": "/walker/start_api_async",
+            "status": "/walker/check_job_status",
+            "validate": "/walker/validate_url",
+            "health": "/health",
+            "version": "/walker/version_info"
+        }
+    
+    def get_endpoint_url(self, endpoint: str) -> str:
+        """Get full URL for an endpoint"""
+        return f"{self.api_base_url}{self.endpoints.get(endpoint, '')}"
+
+
+class APIStatus(Enum):
+    """API health status"""
+    HEALTHY = "healthy"
+    UNHEALTHY = "unhealthy"
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class HealthInfo:
+    """API health information"""
+    status: APIStatus
+    active_requests: int = 0
+    api_version: str = "unknown"
+    error_message: Optional[str] = None
+
+
+@dataclass
+class GenerationOptions:
+    """Documentation generation options"""
+    use_async: bool = False
+    generate_ccg: bool = True
+    generate_api_docs: bool = True
+    generate_architecture: bool = True
+
+
+@dataclass
+class HistoryItem:
+    """Generation history item"""
+    url: str
+    timestamp: str
+    status: str
+    success: bool
+    processing_time: Optional[float] = None
+
 
 # ============================================================================
 # Initialize Session State
 # ============================================================================
 
 def init_session_state():
-    """Initialize Streamlit session state variables"""
-    if "history" not in st.session_state:
-        st.session_state.history = []
-    if "current_job" not in st.session_state:
-        st.session_state.current_job = None
-    if "api_available" not in st.session_state:
-        st.session_state.api_available = None
-    if "theme" not in st.session_state:
-        st.session_state.theme = "light"
-
-# ============================================================================
-# API Client Functions
-# ============================================================================
-
-def check_api_health() -> Tuple[str, str]:
-    """
-    Check if API is available and healthy
-
-    Returns:
-        Tuple[str, str]: (status, health_info_json)
-    """
-    try:
-        response = requests.get(
-            f"{Config.API_BASE_URL}{Config.ENDPOINTS['health']}",
-            timeout=5
-        )
-
-        if response.status_code == 200:
-            return "healthy", json.dumps(response.json())
-        else:
-            return "unhealthy", json.dumps({"error": f"HTTP {response.status_code}"})
-    except Exception as e:
-        return "unhealthy", json.dumps({"error": str(e)})
-
-def validate_url(url: str) -> Dict[str, Any]:
-    """
-    Validate repository URL before processing
+    """Initialize Streamlit session state with defaults"""
+    defaults = {
+        "history": [],
+        "current_job": None,
+        "api_available": None,
+        "config": Config()
+    }
     
-    Args:
-        url: Repository URL to validate
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+# ============================================================================
+# API Client
+# ============================================================================
+
+class APIClient:
+    """Centralized API client with error handling"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.session = requests.Session()
+        self.session.headers.update({"Content-Type": "application/json"})
+    
+    def _make_request(
+        self,
+        method: str,
+        endpoint: str,
+        timeout: int = 10,
+        **kwargs
+    ) -> tuple[bool, dict]:
+        """
+        Make HTTP request with error handling
         
-    Returns:
-        dict: Validation result
-    """
-    try:
-        response = requests.post(
-            f"{Config.API_BASE_URL}{Config.ENDPOINTS['validate']}",
+        Returns:
+            Tuple[bool, dict]: (success, response_data)
+        """
+        try:
+            url = self.config.get_endpoint_url(endpoint)
+            response = self.session.request(
+                method,
+                url,
+                timeout=timeout,
+                **kwargs
+            )
+            
+            if response.status_code == 200:
+                return True, response.json()
+            else:
+                return False, {
+                    "error": f"HTTP {response.status_code}",
+                    "message": response.text
+                }
+                
+        except requests.exceptions.Timeout:
+            return False, {"error": "Request timed out"}
+        except requests.exceptions.ConnectionError:
+            return False, {"error": "Cannot connect to API server"}
+        except requests.exceptions.RequestException as e:
+            return False, {"error": str(e)}
+        except json.JSONDecodeError:
+            return False, {"error": "Invalid JSON response"}
+    
+    def check_health(self) -> HealthInfo:
+        """Check API health status"""
+        success, data = self._make_request("GET", "health", timeout=5)
+        
+        if success:
+            return HealthInfo(
+                status=APIStatus.HEALTHY,
+                active_requests=data.get("active_requests", 0),
+                api_version=data.get("api_version", "unknown")
+            )
+        else:
+            return HealthInfo(
+                status=APIStatus.UNHEALTHY,
+                error_message=data.get("error", "Unknown error")
+            )
+    
+    def validate_url(self, url: str) -> dict:
+        """Validate repository URL"""
+        success, data = self._make_request(
+            "POST",
+            "validate",
             json={"url": url},
             timeout=10
         )
         
-        if response.status_code == 200:
-            return response.json()
-        else:
+        if not success:
             return {
                 "valid": False,
-                "message": f"Validation failed: HTTP {response.status_code}"
+                "message": data.get("error", "Validation failed")
             }
-    except requests.exceptions.Timeout:
-        return {
-            "valid": False,
-            "message": "Validation request timed out"
-        }
-    except requests.exceptions.ConnectionError:
-        return {
-            "valid": False,
-            "message": "Cannot connect to API server"
-        }
-    except Exception as e:
-        return {
-            "valid": False,
-            "message": f"Validation error: {str(e)}"
-        }
-
-def generate_docs_sync(url: str) -> Dict[str, Any]:
-    """
-    Generate documentation synchronously
-    
-    Args:
-        url: Repository URL
         
-    Returns:
-        dict: Generation result
-    """
-    try:
-        response = requests.post(
-            f"{Config.API_BASE_URL}{Config.ENDPOINTS['sync']}",
+        return data
+    
+    def generate_docs_sync(self, url: str) -> dict:
+        """Generate documentation synchronously"""
+        success, data = self._make_request(
+            "POST",
+            "sync",
             json={"url": url},
-            timeout=Config.REQUEST_TIMEOUT
+            timeout=self.config.request_timeout
         )
         
-        if response.status_code == 200:
-            return response.json()
-        else:
+        if not success:
             return {
                 "success": False,
-                "message": f"API error: HTTP {response.status_code}",
+                "message": data.get("error", "Generation failed"),
                 "status": "error"
             }
-    except requests.exceptions.Timeout:
-        return {
-            "success": False,
-            "message": "Request timed out (try async mode for large repos)",
-            "status": "timeout"
-        }
-    except requests.exceptions.ConnectionError:
-        return {
-            "success": False,
-            "message": "Cannot connect to API server",
-            "status": "error"
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "message": f"Error: {str(e)}",
-            "status": "error"
-        }
-
-def generate_docs_async(url: str) -> Dict[str, Any]:
-    """
-    Start asynchronous documentation generation
-    
-    Args:
-        url: Repository URL
         
-    Returns:
-        dict: Job information
-    """
-    try:
-        response = requests.post(
-            f"{Config.API_BASE_URL}{Config.ENDPOINTS['async']}",
+        return data
+    
+    def generate_docs_async(self, url: str) -> dict:
+        """Start asynchronous documentation generation"""
+        success, data = self._make_request(
+            "POST",
+            "async",
             json={"url": url},
             timeout=30
         )
         
-        if response.status_code == 200:
-            return response.json()
-        else:
+        if not success:
             return {
                 "success": False,
-                "message": f"API error: HTTP {response.status_code}"
+                "message": data.get("error", "Failed to start job")
             }
-    except Exception as e:
-        return {
-            "success": False,
-            "message": f"Error: {str(e)}"
-        }
-
-def check_job_status(job_id: str) -> Dict[str, Any]:
-    """
-    Check status of async job
-    
-    Args:
-        job_id: Job identifier
         
-    Returns:
-        dict: Job status
-    """
-    try:
-        response = requests.post(
-            f"{Config.API_BASE_URL}{Config.ENDPOINTS['status']}",
+        return data
+    
+    def check_job_status(self, job_id: str) -> dict:
+        """Check async job status"""
+        success, data = self._make_request(
+            "POST",
+            "status",
             json={"job_id": job_id},
             timeout=10
         )
         
-        if response.status_code == 200:
-            return response.json()
-        else:
+        if not success:
             return {
                 "completed": False,
                 "status": "error",
-                "message": f"Status check failed: HTTP {response.status_code}"
+                "message": data.get("error", "Status check failed")
             }
-    except Exception as e:
-        return {
-            "completed": False,
-            "status": "error",
-            "message": f"Error: {str(e)}"
-        }
+        
+        return data
+    
+    def get_version(self) -> Optional[dict]:
+        """Get API version information"""
+        success, data = self._make_request("GET", "version", timeout=5)
+        return data if success else None
 
-def get_api_version() -> Optional[Dict]:
-    """Get API version information"""
-    try:
-        response = requests.get(
-            f"{Config.API_BASE_URL}{Config.ENDPOINTS['version']}",
-            timeout=5
-        )
-        if response.status_code == 200:
-            return response.json()
-    except:
-        pass
-    return None
 
 # ============================================================================
 # UI Components
 # ============================================================================
 
-def render_header():
-    """Render application header"""
-    st.title(f"🚀 {Config.APP_TITLE}")
-    st.markdown(f"**{Config.APP_SUBTITLE}**")
-    st.markdown("---")
-
-def render_api_status():
-    """Render API health status in sidebar"""
-    st.sidebar.markdown("### 🔌 API Status")
-
-    status, health_info_json = check_api_health()
-    is_healthy = status == "healthy"
-    health_info = json.loads(health_info_json) if health_info_json != "{}" else None
-
-    if is_healthy:
-        st.sidebar.success("✅ API Connected")
-        if health_info:
-            st.sidebar.caption(f"Active requests: {health_info.get('active_requests', 0)}")
-            api_version = health_info.get('api_version', 'unknown')
-            st.sidebar.caption(f"Version: {api_version}")
-    else:
-        st.sidebar.error("❌ API Unavailable")
-        st.sidebar.caption(f"Endpoint: {Config.API_BASE_URL}")
-
-    st.session_state.api_available = is_healthy
-    return is_healthy
-
-def render_url_input() -> str:
-    """Render URL input field with validation"""
-    st.markdown("### 📝 Enter Repository URL")
+class UIComponents:
+    """Reusable UI components"""
     
-    url = st.text_input(
-        "GitHub/GitLab/Bitbucket HTTPS URL",
-        placeholder="https://github.com/username/repository",
-        help="Enter the HTTPS URL of the repository you want to document",
-        key="repo_url"
-    )
+    @staticmethod
+    def render_header():
+        """Render application header"""
+        config = st.session_state.config
+        st.title(f"🚀 {config.app_title}")
+        st.markdown(f"**{config.app_subtitle}**")
+        st.markdown("---")
     
-    # Show examples
-    with st.expander("📚 Example URLs"):
-        st.code("https://github.com/torvalds/linux")
-        st.code("https://github.com/microsoft/vscode")
-        st.code("https://gitlab.com/gitlab-org/gitlab")
-        st.code("https://bitbucket.org/atlassian/python-bitbucket")
+    @staticmethod
+    def render_api_status(client: APIClient) -> bool:
+        """Render API health status in sidebar"""
+        st.sidebar.markdown("### 🔌 API Status")
+        
+        health_info = client.check_health()
+        is_healthy = health_info.status == APIStatus.HEALTHY
+        
+        if is_healthy:
+            st.sidebar.success("✅ API Connected")
+            st.sidebar.caption(f"Active requests: {health_info.active_requests}")
+            st.sidebar.caption(f"Version: {health_info.api_version}")
+        else:
+            st.sidebar.error("❌ API Unavailable")
+            if health_info.error_message:
+                st.sidebar.caption(health_info.error_message)
+        
+        st.session_state.api_available = is_healthy
+        return is_healthy
     
-    return url
-
-def render_options() -> Dict[str, Any]:
-    """Render generation options"""
-    st.markdown("### ⚙️ Generation Options")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        use_async = st.checkbox(
-            "Async Mode",
-            value=False,
-            help="Use async mode for large repositories (>100MB)"
+    @staticmethod
+    def render_url_input() -> str:
+        """Render URL input field with examples"""
+        st.markdown("### 📝 Enter Repository URL")
+        
+        url = st.text_input(
+            "GitHub/GitLab/Bitbucket HTTPS URL",
+            placeholder="https://github.com/username/repository",
+            help="Enter the HTTPS URL of the repository you want to document",
+            key="repo_url"
         )
         
-        include_ccg = st.checkbox(
-            "Generate Code Call Graph",
-            value=True,
-            help="Generate visualization of code relationships"
-        )
-    
-    with col2:
-        include_api_docs = st.checkbox(
-            "Generate API Docs",
-            value=True,
-            help="Generate API reference documentation"
-        )
+        with st.expander("📚 Example URLs"):
+            examples = [
+                "https://github.com/torvalds/linux",
+                "https://github.com/microsoft/vscode",
+                "https://gitlab.com/gitlab-org/gitlab",
+                "https://bitbucket.org/atlassian/python-bitbucket"
+            ]
+            for example in examples:
+                st.code(example)
         
-        include_architecture = st.checkbox(
-            "Generate Architecture Docs",
-            value=True,
-            help="Generate architecture overview"
-        )
+        return url
     
-    return {
-        "use_async": use_async,
-        "options": {
-            "generate_ccg": include_ccg,
-            "generate_api_docs": include_api_docs,
-            "generate_architecture": include_architecture
-        }
-    }
-
-def render_validation_result(validation: Dict[str, Any]):
-    """Render URL validation result"""
-    if validation.get("valid"):
-        st.success(f"✅ Valid {validation.get('source', 'repository')} URL")
-        if "normalized_url" in validation:
-            st.info(f"📎 Normalized: `{validation['normalized_url']}`")
-    else:
-        st.error(f"❌ Invalid URL: {validation.get('message', 'Unknown error')}")
-
-def render_progress_bar(progress: float, status_text: str):
-    """Render progress bar with status"""
-    st.progress(progress)
-    st.caption(status_text)
-
-def render_result_success(result: Dict[str, Any]):
-    """Render successful generation result"""
-    st.success("✅ Documentation Generated Successfully!")
-    
-    # Display metadata
-    if "metadata" in result:
-        metadata = result["metadata"]
+    @staticmethod
+    def render_options() -> GenerationOptions:
+        """Render generation options"""
+        st.markdown("### ⚙️ Generation Options")
         
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns(2)
         
         with col1:
-            st.metric(
-                "Processing Time",
-                f"{metadata.get('processing_time_ms', 0) / 1000:.2f}s"
+            use_async = st.checkbox(
+                "Async Mode",
+                value=False,
+                help="Use async mode for large repositories (>100MB)"
+            )
+            
+            include_ccg = st.checkbox(
+                "Generate Code Call Graph",
+                value=True,
+                help="Generate visualization of code relationships"
             )
         
         with col2:
-            st.metric(
-                "Files Documented",
-                metadata.get('files_documented', 0)
+            include_api_docs = st.checkbox(
+                "Generate API Docs",
+                value=True,
+                help="Generate API reference documentation"
+            )
+            
+            include_architecture = st.checkbox(
+                "Generate Architecture Docs",
+                value=True,
+                help="Generate architecture overview"
             )
         
-        with col3:
-            st.metric(
-                "Total Lines",
-                f"{metadata.get('total_lines', 0):,}"
-            )
+        return GenerationOptions(
+            use_async=use_async,
+            generate_ccg=include_ccg,
+            generate_api_docs=include_api_docs,
+            generate_architecture=include_architecture
+        )
     
-    # Display output paths
-    if "data" in result and "outputs" in result["data"]:
-        outputs = result["data"]["outputs"]
-        
-        st.markdown("### 📄 Generated Files")
-        
-        if outputs.get("markdown"):
-            st.code(outputs["markdown"], language=None)
-        
-        if outputs.get("html"):
-            st.code(outputs["html"], language=None)
-        
-        if outputs.get("ccg"):
-            st.code(outputs["ccg"], language=None)
-        
-        # Additional files
-        if "additional" in outputs:
-            with st.expander("📚 Additional Documentation"):
-                for name, path in outputs["additional"].items():
-                    st.code(f"{name}: {path}", language=None)
+    @staticmethod
+    def render_validation_result(validation: dict):
+        """Render URL validation result"""
+        if validation.get("valid"):
+            source = validation.get("source", "repository")
+            st.success(f"✅ Valid {source} URL")
+            
+            if "normalized_url" in validation:
+                st.info(f"📎 Normalized: `{validation['normalized_url']}`")
+        else:
+            message = validation.get("message", "Unknown error")
+            st.error(f"❌ Invalid URL: {message}")
     
-    # Display warnings if any
-    if result.get("warnings") and len(result["warnings"]) > 0:
-        with st.expander("⚠️ Warnings"):
-            for warning in result["warnings"]:
-                st.warning(warning.get("warning", str(warning)))
-    
-    # Download buttons (if file paths are accessible)
-    st.markdown("### 💾 Download Documentation")
-    st.info("📝 Documentation files are saved on the server. Contact your administrator to retrieve them.")
-
-def render_result_error(result: Dict[str, Any]):
-    """Render error result"""
-    st.error(f"❌ Generation Failed: {result.get('message', 'Unknown error')}")
-    
-    # Display detailed errors
-    if result.get("errors") and len(result["errors"]) > 0:
-        with st.expander("🔍 Error Details"):
-            for error in result["errors"]:
-                if isinstance(error, dict):
-                    st.code(json.dumps(error, indent=2), language="json")
-                else:
-                    st.code(str(error))
-    
-    # Suggestions
-    st.markdown("### 💡 Suggestions")
-    
-    if result.get("status") == "invalid_input":
-        st.info("Check that your URL is correctly formatted and from a supported source (GitHub, GitLab, or Bitbucket)")
-    elif result.get("status") == "timeout":
-        st.info("The repository may be too large. Try using Async Mode for better handling of large repositories")
-    elif result.get("status") == "rate_limited":
-        retry_after = result.get("errors", [{}])[0].get("retry_after_seconds", 60)
-        st.info(f"Rate limit exceeded. Please wait {retry_after} seconds before trying again")
-    else:
-        st.info("Check the API logs for more details or contact support")
-
-def render_async_progress(job_id: str) -> Dict[str, Any]:
-    """
-    Render async job progress with polling
-    
-    Args:
-        job_id: Job identifier
+    @staticmethod
+    def render_result_success(result: dict):
+        """Render successful generation result"""
+        st.success("✅ Documentation Generated Successfully!")
         
-    Returns:
-        dict: Final job result
-    """
-    progress_placeholder = st.empty()
-    status_placeholder = st.empty()
-    details_placeholder = st.empty()
-    
-    max_polls = 300  # 10 minutes with 2-second intervals
-    poll_count = 0
-    
-    while poll_count < max_polls:
-        status = check_job_status(job_id)
-        
-        if status.get("completed"):
-            progress_placeholder.progress(1.0)
-            status_placeholder.success("✅ Job Completed!")
-            return status.get("result", {})
-        
-        # Update progress
-        progress = status.get("progress_percent", 0) / 100.0
-        current_step = status.get("current_step", "processing")
-        
-        progress_placeholder.progress(progress)
-        status_placeholder.info(f"⏳ {status.get('message', 'Processing...')}")
-        
-        # Show details
-        with details_placeholder.container():
-            col1, col2 = st.columns(2)
+        # Display metrics
+        if "metadata" in result:
+            metadata = result["metadata"]
+            
+            col1, col2, col3 = st.columns(3)
+            
             with col1:
-                st.caption(f"Step: {current_step}")
+                processing_time = metadata.get("processing_time_ms", 0) / 1000
+                st.metric("Processing Time", f"{processing_time:.2f}s")
+            
             with col2:
-                st.caption(f"Progress: {int(progress * 100)}%")
+                files_count = metadata.get("files_documented", 0)
+                st.metric("Files Documented", files_count)
+            
+            with col3:
+                total_lines = metadata.get("total_lines", 0)
+                st.metric("Total Lines", f"{total_lines:,}")
         
-        time.sleep(Config.POLL_INTERVAL)
-        poll_count += 1
-    
-    # Timeout
-    status_placeholder.error("⏱️ Job polling timed out")
-    return {
-        "success": False,
-        "message": "Job status polling timed out",
-        "status": "timeout"
-    }
-
-def render_history():
-    """Render generation history in sidebar"""
-    if not st.session_state.history:
-        return
-    
-    st.sidebar.markdown("### 📜 Recent Generations")
-    
-    for idx, item in enumerate(reversed(st.session_state.history[-5:])):
-        with st.sidebar.expander(f"🔹 {item['url'][:30]}..."):
-            st.caption(f"Time: {item['timestamp']}")
-            st.caption(f"Status: {item['status']}")
-            if item.get('success'):
-                st.success("✅ Success")
+        # Display output paths
+        if "data" in result and "outputs" in result["data"]:
+            outputs = result["data"]["outputs"]
+            
+            st.markdown("### 📄 Generated Files")
+            
+            output_files = [
+                ("Markdown", outputs.get("markdown")),
+                ("HTML", outputs.get("html")),
+                ("Code Call Graph", outputs.get("ccg"))
+            ]
+            
+            for label, path in output_files:
+                if path:
+                    st.code(f"{label}: {path}")
+            
+            # Additional files
+            if "additional" in outputs:
+                with st.expander("📚 Additional Documentation"):
+                    for name, path in outputs["additional"].items():
+                        st.code(f"{name}: {path}")
+        
+        # Display warnings
+        warnings = result.get("warnings", [])
+        if warnings:
+            with st.expander(f"⚠️ Warnings ({len(warnings)})"):
+                for warning in warnings:
+                    warning_text = warning.get("warning", str(warning))
+                    st.warning(warning_text)
+        
+        # Download info
+        st.markdown("### 💾 Download Documentation")
+        
+        # Extract repo name from outputs
+        outputs = result.get("data", {}).get("outputs", {})
+        markdown_path = outputs.get("markdown", "")
+        
+        if markdown_path:
+            # Extract repo name from path (e.g., /outputs/Generative-AI/docs.md)
+            import re
+            match = re.search(r'/outputs/([^/]+)/', markdown_path)
+            if match:
+                repo_name = match.group(1)
+                base_url = st.session_state.config.api_base_url
+                
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    markdown_url = f"{base_url}/outputs/{repo_name}/docs.md"
+                    st.markdown(f"[📥 Download Markdown]({markdown_url})")
+                
+                with col2:
+                    html_url = f"{base_url}/outputs/{repo_name}/docs.html"
+                    st.markdown(f"[🌐 View HTML]({html_url})")
+                
+                with col3:
+                    list_url = f"{base_url}/outputs/{repo_name}/list"
+                    st.markdown(f"[📋 List All Files]({list_url})")
+                
+                st.caption(f"Files are available at: `{base_url}/outputs/{repo_name}/`")
             else:
-                st.error("❌ Failed")
+                st.info("📝 Documentation files are saved on the server. Contact your administrator to retrieve them.")
+        else:
+            st.info("📝 Documentation files are saved on the server. Contact your administrator to retrieve them.")
+    
+    @staticmethod
+    def render_result_error(result: dict):
+        """Render error result"""
+        message = result.get("message", "Unknown error")
+        st.error(f"❌ Generation Failed: {message}")
+        
+        # Display detailed errors
+        errors = result.get("errors", [])
+        if errors:
+            with st.expander(f"🔍 Error Details ({len(errors)})"):
+                for error in errors:
+                    if isinstance(error, dict):
+                        st.code(json.dumps(error, indent=2), language="json")
+                    else:
+                        st.code(str(error))
+        
+        # Suggestions
+        UIComponents._render_error_suggestions(result)
+    
+    @staticmethod
+    def _render_error_suggestions(result: dict):
+        """Render error-specific suggestions"""
+        st.markdown("### 💡 Suggestions")
+        
+        status = result.get("status")
+        suggestions = {
+            "invalid_input": "Check that your URL is correctly formatted and from a supported source (GitHub, GitLab, or Bitbucket)",
+            "timeout": "The repository may be too large. Try using Async Mode for better handling of large repositories",
+            "rate_limited": None  # Special handling below
+        }
+        
+        if status == "rate_limited":
+            errors = result.get("errors", [{}])
+            retry_after = errors[0].get("retry_after_seconds", 60) if errors else 60
+            st.info(f"Rate limit exceeded. Please wait {retry_after} seconds before trying again")
+        elif status in suggestions and suggestions[status]:
+            st.info(suggestions[status])
+        else:
+            st.info("Check the API logs for more details or contact support")
+    
+    @staticmethod
+    def render_async_progress(client: APIClient, job_id: str) -> dict:
+        """Render async job progress with polling"""
+        progress_bar = st.progress(0.0)
+        status_text = st.empty()
+        details_container = st.container()
+        
+        max_polls = 300  # 10 minutes
+        poll_count = 0
+        config = st.session_state.config
+        
+        while poll_count < max_polls:
+            status = client.check_job_status(job_id)
+            
+            if status.get("completed"):
+                progress_bar.progress(1.0)
+                status_text.success("✅ Job Completed!")
+                return status.get("result", {})
+            
+            # Update progress
+            progress = status.get("progress_percent", 0) / 100.0
+            current_step = status.get("current_step", "processing")
+            message = status.get("message", "Processing...")
+            
+            progress_bar.progress(progress)
+            status_text.info(f"⏳ {message}")
+            
+            # Show details
+            with details_container:
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.caption(f"Step: {current_step}")
+                with col2:
+                    st.caption(f"Progress: {int(progress * 100)}%")
+            
+            time.sleep(config.poll_interval)
+            poll_count += 1
+        
+        # Timeout
+        status_text.error("⏱️ Job polling timed out")
+        return {
+            "success": False,
+            "message": "Job status polling timed out",
+            "status": "timeout"
+        }
+    
+    @staticmethod
+    def render_history():
+        """Render generation history in sidebar"""
+        history = st.session_state.history
+        if not history:
+            return
+        
+        st.sidebar.markdown("### 📜 Recent Generations")
+        
+        config = st.session_state.config
+        recent_items = list(reversed(history[-config.max_history:]))
+        
+        for item in recent_items:
+            url_preview = item["url"][:30] + "..." if len(item["url"]) > 30 else item["url"]
+            
+            with st.sidebar.expander(f"🔹 {url_preview}"):
+                st.caption(f"Time: {item['timestamp']}")
+                st.caption(f"Status: {item['status']}")
+                
+                if item.get("processing_time"):
+                    st.caption(f"Duration: {item['processing_time']:.2f}s")
+                
+                if item['success']:
+                    st.success("✅ Success")
+                else:
+                    st.error("❌ Failed")
 
-def add_to_history(url: str, result: Dict[str, Any]):
+
+# ============================================================================
+# History Management
+# ============================================================================
+
+def add_to_history(url: str, result: dict):
     """Add generation to history"""
-    st.session_state.history.append({
-        "url": url,
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "status": result.get("status", "unknown"),
-        "success": result.get("success", False),
-        "result": result
-    })
+    processing_time = None
+    
+    if "metadata" in result:
+        metadata = result["metadata"]
+        processing_time = metadata.get("processing_time_ms", 0) / 1000
+    
+    history_item = HistoryItem(
+        url=url,
+        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        status=result.get("status", "unknown"),
+        success=result.get("success", False),
+        processing_time=processing_time
+    )
+    
+    st.session_state.history.append(asdict(history_item))
+    
+    # Limit history size
+    config = st.session_state.config
+    max_size = config.max_history * 2  # Keep more in memory
+    if len(st.session_state.history) > max_size:
+        st.session_state.history = st.session_state.history[-max_size:]
+
 
 # ============================================================================
 # Main Application
@@ -510,14 +599,17 @@ def main():
     
     # Page configuration
     st.set_page_config(
-        page_title=Config.APP_TITLE,
+        page_title="Codebase Genius",
         page_icon="🚀",
         layout="wide",
         initial_sidebar_state="expanded"
     )
     
-    # Initialize session state
+    # Initialize
     init_session_state()
+    config = st.session_state.config
+    client = APIClient(config)
+    ui = UIComponents()
     
     # Custom CSS
     st.markdown("""
@@ -533,61 +625,52 @@ def main():
         .stButton>button:hover {
             background-color: #45a049;
         }
-        .success-box {
-            padding: 1rem;
-            background-color: #d4edda;
-            border: 1px solid #c3e6cb;
-            border-radius: 0.5rem;
-            margin: 1rem 0;
-        }
-        .error-box {
-            padding: 1rem;
-            background-color: #f8d7da;
-            border: 1px solid #f5c6cb;
-            border-radius: 0.5rem;
-            margin: 1rem 0;
-        }
         </style>
     """, unsafe_allow_html=True)
     
     # Render header
-    render_header()
+    ui.render_header()
     
     # Sidebar
     with st.sidebar:
         st.markdown("## 🎛️ Control Panel")
         
         # API status
-        api_available = render_api_status()
+        api_available = ui.render_api_status(client)
         
         st.markdown("---")
         
         # History
-        render_history()
+        ui.render_history()
         
         st.markdown("---")
         
         # Info
         st.markdown("### ℹ️ About")
-        st.caption("Codebase Genius automatically generates comprehensive documentation for your repositories using AI-powered code analysis.")
+        st.caption("Automatically generates comprehensive documentation for repositories using AI-powered code analysis.")
         
         # Version info
-        version_info = get_api_version()
+        version_info = client.get_version()
         if version_info:
-            st.caption(f"API Version: {version_info.get('api_version', 'unknown')}")
+            api_version = version_info.get("api_version", "unknown")
+            st.caption(f"API Version: {api_version}")
     
-    # Main content
+    # Check API availability
     if not api_available:
         st.error("⚠️ Cannot connect to API server. Please ensure the backend is running.")
-        st.info(f"Expected endpoint: {Config.API_BASE_URL}")
-        st.code(f"# Start the backend with:\npython -m uvicorn main:app --host 0.0.0.0 --port 8000", language="bash")
+        st.info(f"Expected endpoint: {config.api_base_url}")
+        st.code(
+            "# Start the backend with:\n"
+            "python -m uvicorn main:app --host 0.0.0.0 --port 8000",
+            language="bash"
+        )
         return
     
     # URL input
-    url = render_url_input()
+    url = ui.render_url_input()
     
     # Options
-    options = render_options()
+    options = ui.render_options()
     
     # Generate button
     st.markdown("---")
@@ -602,19 +685,19 @@ def main():
     
     # Generation logic
     if generate_button:
-        if not url:
+        if not url or not url.strip():
             st.error("❌ Please enter a repository URL")
             return
         
-        # Validate URL first
+        # Validate URL
         st.markdown("### 🔍 Validating URL...")
-        validation = validate_url(url)
-        render_validation_result(validation)
+        validation = client.validate_url(url)
+        ui.render_validation_result(validation)
         
         if not validation.get("valid"):
             return
         
-        # Use normalized URL if available
+        # Use normalized URL
         normalized_url = validation.get("normalized_url", url)
         
         # Generate documentation
@@ -622,40 +705,43 @@ def main():
         st.markdown("### 🔄 Generating Documentation...")
         
         try:
-            if options["use_async"]:
+            if options.use_async:
                 # Async mode
                 st.info("📤 Starting async job...")
-                job_info = generate_docs_async(normalized_url)
+                job_info = client.generate_docs_async(normalized_url)
                 
                 if not job_info.get("success"):
-                    st.error(f"❌ Failed to start job: {job_info.get('message')}")
+                    error_msg = job_info.get("message", "Unknown error")
+                    st.error(f"❌ Failed to start job: {error_msg}")
                     return
                 
                 job_id = job_info.get("job_id")
                 st.success(f"✅ Job queued with ID: `{job_id}`")
-                st.info(f"⏱️ Estimated time: {job_info.get('estimated_completion_seconds', 120)} seconds")
+                
+                estimated_time = job_info.get("estimated_completion_seconds", 120)
+                st.info(f"⏱️ Estimated time: {estimated_time} seconds")
                 
                 # Poll for completion
-                result = render_async_progress(job_id)
+                result = ui.render_async_progress(client, job_id)
             else:
                 # Sync mode
                 with st.spinner("⏳ Processing... This may take a few minutes for large repositories"):
-                    result = generate_docs_sync(normalized_url)
+                    result = client.generate_docs_sync(normalized_url)
             
             # Display result
             st.markdown("---")
             st.markdown("### 📊 Result")
             
             if result.get("success"):
-                render_result_success(result)
-                add_to_history(url, result)
+                ui.render_result_success(result)
             else:
-                render_result_error(result)
-                add_to_history(url, result)
+                ui.render_result_error(result)
+            
+            add_to_history(url, result)
                 
         except Exception as e:
+            logger.exception("Unexpected error during generation")
             st.error(f"❌ Unexpected error: {str(e)}")
-            st.exception(e)
     
     # Footer
     st.markdown("---")
@@ -666,146 +752,6 @@ def main():
         </div>
     """, unsafe_allow_html=True)
 
-# ============================================================================
-# Utility Pages (Optional)
-# ============================================================================
-
-def render_settings_page():
-    """Render settings page"""
-    st.title("⚙️ Settings")
-    
-    st.markdown("### 🔌 API Configuration")
-    
-    api_url = st.text_input(
-        "API Base URL",
-        value=Config.API_BASE_URL,
-        help="URL of the Codebase Genius API server"
-    )
-    
-    if st.button("💾 Save Settings"):
-        os.environ["API_BASE_URL"] = api_url
-        Config.API_BASE_URL = api_url
-        st.success("✅ Settings saved!")
-        st.experimental_rerun()
-    
-    st.markdown("---")
-    st.markdown("### 🧪 Test Connection")
-    
-    if st.button("🔍 Test API Connection"):
-        status, health_info_json = check_api_health()
-        is_healthy = status == "healthy"
-        health_info = json.loads(health_info_json) if health_info_json != "{}" else None
-
-        if is_healthy:
-            st.success("✅ API is healthy!")
-            st.json(health_info)
-        else:
-            st.error("❌ Cannot connect to API")
-
-def render_docs_page():
-    """Render documentation page"""
-    st.title("📚 Documentation")
-    
-    st.markdown("""
-    ## How to Use Codebase Genius
-    
-    ### 1️⃣ Enter Repository URL
-    Enter the HTTPS URL of your GitHub, GitLab, or Bitbucket repository.
-    
-    **Supported formats:**
-    - `https://github.com/username/repository`
-    - `https://gitlab.com/username/repository`
-    - `https://bitbucket.org/username/repository`
-    
-    ### 2️⃣ Choose Options
-    
-    **Async Mode**: Recommended for large repositories (>100MB). Processes in the background.
-    
-    **Code Call Graph**: Generates a visual graph showing code relationships.
-    
-    **API Docs**: Generates API reference documentation.
-    
-    **Architecture Docs**: Generates architecture overview documentation.
-    
-    ### 3️⃣ Generate
-    Click the "Generate Documentation" button and wait for processing.
-    
-    ### 4️⃣ Download
-    Once complete, documentation files will be available on the server.
-    
-    ## Features
-    
-    - ✅ **Automatic Analysis**: AI-powered code analysis
-    - ✅ **Multiple Formats**: Markdown, HTML, PDF support
-    - ✅ **Code Call Graphs**: Visual dependency mapping
-    - ✅ **API Documentation**: Automatic API reference generation
-    - ✅ **Architecture Docs**: System architecture overview
-    - ✅ **Real-time Progress**: Track generation progress
-    - ✅ **Error Recovery**: Graceful handling of issues
-    
-    ## Supported Languages
-    
-    - Python
-    - JavaScript/TypeScript
-    - Java
-    - Go
-    - Rust
-    - C/C++
-    - Jac
-    - And more...
-    
-    ## Tips
-    
-    💡 **For large repositories**: Use Async Mode to avoid timeouts
-    
-    💡 **Private repositories**: Ensure the API has access credentials
-    
-    💡 **Rate limits**: Wait between requests if you hit rate limits
-    
-    ## Troubleshooting
-    
-    ### API Connection Failed
-    - Ensure the backend server is running
-    - Check firewall settings
-    - Verify the API URL in settings
-    
-    ### Generation Timeout
-    - Use Async Mode for large repositories
-    - Check repository accessibility
-    - Ensure repository is not too large (>500MB)
-    
-    ### Invalid URL
-    - Use HTTPS URLs only
-    - Ensure repository is public or API has access
-    - Check URL format matches supported sources
-    """)
-
-# ============================================================================
-# Multi-Page Navigation (Optional)
-# ============================================================================
-
-def render_navigation():
-    """Render page navigation"""
-    pages = {
-        "🏠 Home": main,
-        "⚙️ Settings": render_settings_page,
-        "📚 Documentation": render_docs_page
-    }
-    
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### 🧭 Navigation")
-    
-    selection = st.sidebar.radio("Go to", list(pages.keys()), label_visibility="collapsed")
-    
-    pages[selection]()
-
-# ============================================================================
-# Application Entry Point
-# ============================================================================
 
 if __name__ == "__main__":
-    # Simple single-page mode
     main()
-    
-    # For multi-page mode, use:
-    # render_navigation()

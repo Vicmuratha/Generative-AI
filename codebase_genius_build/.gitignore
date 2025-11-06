@@ -9,3 +9,15 @@ env/
 .env
 *.log
 .DS_Store
+echo "*.session*" >> .gitignore
+echo "outputs/" >> .gitignore
+echo "venv/" >> .gitignore
+echo "__pycache__/" >> .gitignore
+
+# Add these patterns to your .gitignore
+echo "*.session" >> .gitignore
+echo "*.session.*" >> .gitignore
+echo "outputs/" >> .gitignore
+echo "venv/" >> .gitignore
+echo "-H" >> .gitignore
+echo "-d" >> .gitignore
